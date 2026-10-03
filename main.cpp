@@ -11,11 +11,14 @@ using u64 = uint64_t;
 using u128 = unsigned __int128;
 
 constexpr u64 kTop = 1ULL << 56;
+// Точность и скорость адаптации битовых моделей.
 constexpr int kProbBits = 12;
 constexpr int kAdaptShift = 5;
 
+// 64-битный range coder (перенос как в LZMA).
 class Encoder {
  public:
+  // Кодирует символ с интервалом [cum, cum + freq) из total.
   void Encode(u64 cum, u64 freq, u64 total) {
     u64 r = range_ / total;
     low_ += static_cast<u128>(r * cum);
@@ -25,12 +28,14 @@ class Encoder {
       range_ <<= 8;
     }
   }
+  // Пишет биты как есть, по 16 за раз.
   void EncodeRaw(u64 value, int bits) {
     for (; bits > 16; bits -= 16) {
       Encode((value >> (bits - 16)) & 0xFFFF, 1, 1 << 16);
     }
     Encode(value & ((1ULL << bits) - 1), 1, 1ULL << bits);
   }
+  // Кодирует один бит с адаптивной вероятностью p.
   void EncodeBit(uint16_t* p, int bit) {
     if (bit) {
       Encode(*p, (1 << kProbBits) - *p, 1 << kProbBits);
@@ -40,12 +45,14 @@ class Encoder {
       *p += ((1 << kProbBits) - *p) >> kAdaptShift;
     }
   }
+  // Сбрасывает кодер и возвращает сжатые байты.
   std::string Finish() {
     for (int i = 0; i < 9; ++i) ShiftLow();
     return out_;
   }
 
  private:
+  // Выводит старший байт low_, при необходимости с переносом.
   void ShiftLow() {
     if (static_cast<u64>(low_) < 0xFF00000000000000ULL || (low_ >> 64) != 0) {
       uint8_t carry = static_cast<uint8_t>(low_ >> 64);
@@ -67,15 +74,18 @@ class Encoder {
   std::string out_;
 };
 
+// Декодер: читает то, что записал Encoder.
 class Decoder {
  public:
   explicit Decoder(const std::string& in) : in_(in) {
     for (int i = 0; i < 9; ++i) code_ = (code_ << 8) | NextByte();
   }
+  // Значение в [0, total), по которому ищется следующий символ.
   u64 Target(u64 total) {
     r_ = range_ / total;
     return std::min(code_ / r_, total - 1);
   }
+  // Снимает символ, найденный через Target().
   void Update(u64 cum, u64 freq) {
     code_ -= r_ * cum;
     range_ = r_ * freq;
@@ -84,6 +94,7 @@ class Decoder {
       range_ <<= 8;
     }
   }
+  // Читает биты, записанные EncodeRaw.
   u64 DecodeRaw(int bits) {
     u64 value = 0;
     for (; bits > 0; bits -= 16) {
@@ -94,6 +105,7 @@ class Decoder {
     }
     return value;
   }
+  // Читает бит, записанный EncodeBit.
   int DecodeBit(uint16_t* p) {
     if (Target(1 << kProbBits) >= *p) {
       Update(*p, (1 << kProbBits) - *p);
@@ -117,6 +129,7 @@ class Decoder {
   u64 r_ = 1;
 };
 
+// Дерево Фенвика по оставшимся степеням вершин.
 class Fenwick {
  public:
   explicit Fenwick(const std::vector<uint32_t>& w) : tree_(w.size() + 1) {
@@ -127,14 +140,17 @@ class Fenwick {
     }
     while (high_bit_ * 2 < tree_.size()) high_bit_ *= 2;
   }
+  // Прибавляет delta к весу i.
   void Add(size_t i, int64_t delta) {
     for (++i; i < tree_.size(); i += i & -i) tree_[i] += delta;
   }
+  // Сумма первых n весов.
   u64 Prefix(size_t n) const {
     u64 s = 0;
     for (; n > 0; n -= n & -n) s += tree_[n];
     return s;
   }
+  // Индекс i: Prefix(i) <= x < Prefix(i + 1), rest = x - Prefix(i).
   size_t Find(u64 x, u64* rest) const {
     size_t pos = 0;
     for (size_t step = high_bit_; step > 0; step >>= 1) {
@@ -152,6 +168,7 @@ class Fenwick {
   size_t high_bit_ = 1;
 };
 
+// Адаптивные вероятности, общие для кодера и декодера.
 struct Models {
   uint16_t gap[64];
   uint16_t len[33];
@@ -165,12 +182,14 @@ struct Models {
   }
 };
 
+// Параметр Райса для разностей id, примерно log2 среднего шага.
 int RiceShift(u64 n) {
   int k = 0;
   while (k < 31 && (n << (k + 1)) <= (1ULL << 32) * 7 / 10) ++k;
   return k;
 }
 
+// Гамма-код Элиаса с адаптивными битами, n >= 1.
 void EncodeGamma(Encoder* enc, Models* m, u64 n) {
   int bits = 64 - __builtin_clzll(n);
   for (int j = 1; j < 33; ++j) {
@@ -182,6 +201,7 @@ void EncodeGamma(Encoder* enc, Models* m, u64 n) {
   }
 }
 
+// Читает число, записанное EncodeGamma.
 u64 DecodeGamma(Decoder* dec, Models* m) {
   int bits = 1;
   while (bits < 33 && dec->DecodeBit(&m->len[bits])) ++bits;
@@ -192,6 +212,7 @@ u64 DecodeGamma(Decoder* dec, Models* m) {
   return n;
 }
 
+// Читает весь файл в память.
 bool ReadFile(const char* path, std::string* data) {
   FILE* f = std::fopen(path, "rb");
   if (!f) return false;
@@ -203,6 +224,7 @@ bool ReadFile(const char* path, std::string* data) {
   return got == data->size();
 }
 
+// Записывает буфер в файл.
 bool WriteFile(const char* path, const std::string& data) {
   FILE* f = std::fopen(path, "wb");
   if (!f) return false;
@@ -211,7 +233,9 @@ bool WriteFile(const char* path, const std::string& data) {
   return put == data.size();
 }
 
+// tsv -> бинарный формат.
 std::string Serialize(const std::string& text) {
+  // Парсим все числа: тройки a, b, w.
   std::vector<uint32_t> raw;
   u64 cur = 0;
   bool in_num = false;
@@ -228,6 +252,7 @@ std::string Serialize(const std::string& text) {
   if (in_num) raw.push_back(static_cast<uint32_t>(cur));
   size_t edges = raw.size() / 3;
 
+  // Отсортированные уникальные id, номер вершины = позиция.
   std::vector<uint32_t> ids;
   for (size_t i = 0; i < edges; ++i) {
     ids.push_back(raw[3 * i]);
@@ -241,9 +266,10 @@ std::string Serialize(const std::string& text) {
     return static_cast<uint32_t>(it - ids.begin());
   };
 
+  // Степени, петли и рёбра (a < b), отсортированные по a, затем b.
   std::vector<uint32_t> deg(n, 0), start(n + 1, 0);
   std::vector<int> loop_weight(n, -1);
-  std::vector<u64> packed;  // (a << 40) | (b << 8) | w with a < b
+  std::vector<u64> packed;  // (a << 40) | (b << 8) | w, a < b
   for (size_t i = 0; i < edges; ++i) {
     uint32_t a = index(raw[3 * i]);
     uint32_t b = index(raw[3 * i + 1]);
@@ -261,6 +287,7 @@ std::string Serialize(const std::string& text) {
   std::vector<uint32_t>().swap(raw);
   std::sort(packed.begin(), packed.end());
 
+  // Число вершин, затем id как разности в коде Райса.
   Encoder enc;
   Models m;
   enc.EncodeRaw(n, 32);
@@ -275,12 +302,14 @@ std::string Serialize(const std::string& text) {
     }
     if (k > 0) enc.EncodeRaw(g & ((1ULL << k) - 1), k);
   }
+  // Для каждой вершины: степень и петля, если есть.
   for (size_t u = 0; u < n; ++u) {
     EncodeGamma(&enc, &m, deg[u] + 1);
     enc.EncodeBit(&m.loop, loop_weight[u] >= 0);
     if (loop_weight[u] >= 0) enc.EncodeRaw(loop_weight[u], 8);
   }
 
+  // Сосед v > u кодируется с вероятностью ~ оставшейся deg[v].
   Fenwick fw(deg);
   u64 sum = packed.size() * 2;
   size_t e = 0;
@@ -302,12 +331,14 @@ std::string Serialize(const std::string& text) {
   return enc.Finish();
 }
 
+// Дописывает строку "a	b	w".
 void AppendLine(std::string* out, uint32_t a, uint32_t b, uint32_t w) {
   char buf[40];
   int len = std::snprintf(buf, sizeof(buf), "%u\t%u\t%u\n", a, b, w);
   out->append(buf, len);
 }
 
+// бинарный формат -> tsv, те же шаги, что в Serialize.
 std::string Deserialize(const std::string& bin) {
   Decoder dec(bin);
   Models m;
@@ -330,6 +361,7 @@ std::string Deserialize(const std::string& bin) {
     }
   }
 
+  // Восстанавливаем рёбра так же, как кодировали.
   Fenwick fw(deg);
   u64 sum = 0;
   for (uint32_t d : deg) sum += d;
@@ -356,6 +388,7 @@ std::string Deserialize(const std::string& bin) {
 
 }  // namespace
 
+// Разбирает -s/-d, -i, -o и запускает нужный режим.
 int main(int argc, char** argv) {
   const char* mode = nullptr;
   const char* input = nullptr;
